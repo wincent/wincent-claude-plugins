@@ -6,7 +6,11 @@
 import {StringEnum} from '@earendil-works/pi-ai';
 import {
   type AgentToolResult,
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
   defineTool,
+  formatSize,
+  truncateHead,
 } from '@earendil-works/pi-coding-agent';
 import {type Static, type TSchema, Type} from 'typebox';
 import {Check, Errors} from 'typebox/value';
@@ -50,6 +54,10 @@ export type McpTool = Static<typeof McpToolSchema>;
 
 const McpToolsListResultSchema = Type.Object({
   tools: Type.Array(Type.Unknown()),
+});
+
+const McpInitializeResultSchema = Type.Object({
+  protocolVersion: Type.String(),
 });
 
 // Loose JSON-RPC 2.0 response envelope. We only assert that the envelope is an
@@ -99,10 +107,10 @@ export interface McpClientOptions {
   /** Returns the MCP endpoint URL (may include a query string). */
   url(): string;
   /** Returns a fresh, valid access token; refresh logic lives in the caller. */
-  getAccessToken(): Promise<string>;
+  getAccessToken(signal?: AbortSignal): Promise<string>;
   /**
-   * Invoked once on a 401/404 before the single retry, so the caller can drop
-   * its cached token (the next `getAccessToken` should re-fetch/refresh).
+   * Invoked once on a 401 before the single retry, so the caller can drop its
+   * cached token (the next `getAccessToken` should re-fetch/refresh).
    */
   invalidateAuth?(): void;
   /** Protocol version sent in `initialize`. */
@@ -120,8 +128,12 @@ export interface McpClientOptions {
 }
 
 export interface McpClient {
-  listTools(): Promise<McpTool[]>;
-  callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
+  listTools(signal?: AbortSignal): Promise<McpTool[]>;
+  callTool(
+    name: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown>;
   /** Drop the cached session and tool catalog (e.g. on logout/shutdown). */
   reset(): void;
 }
@@ -131,15 +143,67 @@ export function createMcpClient(opts: McpClientOptions): McpClient {
   const requestTimeoutMs = opts.requestTimeoutMs ?? 30_000;
   const sessionTtlMs = opts.sessionTtlMs ?? 22 * 60 * 60 * 1000;
 
-  let sessionId: string | null = null;
+  let sessionId: string | undefined;
+  let sessionReady = false;
   let sessionFor: string | null = null; // accessToken the session was opened for
   let sessionOpenedAt = 0;
+  let negotiatedProtocolVersion: string | null = null;
   let cachedTools: McpTool[] | null = null;
+  let transportEpoch = 0;
+  let transportController = new AbortController();
+
+  function transportResetError(): Error {
+    const error = new Error(`${opts.label} MCP client was reset`);
+    error.name = 'AbortError';
+    return error;
+  }
+
+  function assertTransportEpoch(epoch: number): void {
+    if (epoch !== transportEpoch) {
+      throw transportResetError();
+    }
+  }
+
+  function clearSession(): void {
+    sessionId = undefined;
+    sessionReady = false;
+    sessionFor = null;
+    sessionOpenedAt = 0;
+    negotiatedProtocolVersion = null;
+  }
+
+  function parseSseResponse(text: string, requestId: unknown): unknown {
+    for (const event of text.split(/\r?\n\r?\n/)) {
+      const data = event
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart())
+        .join('\n');
+      if (!data || data === '[DONE]') {
+        continue;
+      }
+      const parsed: unknown = JSON.parse(data);
+      if (requestId === undefined) {
+        return parsed;
+      }
+      if (
+        parsed !== null &&
+        typeof parsed === 'object' &&
+        'id' in parsed &&
+        (parsed as {id?: unknown}).id === requestId
+      ) {
+        return parsed;
+      }
+    }
+    return null;
+  }
 
   async function mcpFetch(
     accessToken: string,
     body: unknown,
     sid?: string,
+    protocolVersion?: string,
+    signal?: AbortSignal,
   ): Promise<{resp: Response; sessionIdOut: string | null; json: unknown}> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -147,84 +211,145 @@ export function createMcpClient(opts: McpClientOptions): McpClient {
       'Authorization': `Bearer ${accessToken}`,
     };
     if (sid) {
-      headers['mcp-session-id'] = sid;
+      headers['MCP-Session-Id'] = sid;
     }
+    if (protocolVersion) {
+      headers['MCP-Protocol-Version'] = protocolVersion;
+    }
+
+    const requestId = body !== null && typeof body === 'object' && 'id' in body
+      ? (body as {id?: unknown}).id
+      : undefined;
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), requestTimeoutMs);
-    let resp: Response;
+    const abort = () => ctrl.abort();
+    const resetSignal = transportController.signal;
+    if (signal?.aborted || resetSignal.aborted) {
+      ctrl.abort();
+    } else {
+      signal?.addEventListener('abort', abort, {once: true});
+      resetSignal.addEventListener('abort', abort, {once: true});
+    }
+    const timer = setTimeout(() => ctrl.abort(), requestTimeoutMs);
     try {
-      resp = await fetch(opts.url(), {
+      const resp = await fetch(opts.url(), {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
         signal: ctrl.signal,
       });
-    } finally {
-      clearTimeout(t);
-    }
-
-    const sessionIdOut = resp.headers.get('mcp-session-id');
-    const contentType = (resp.headers.get('content-type') ?? '').toLowerCase();
-    let json: unknown = null;
-    if (resp.ok) {
-      const text = await resp.text();
-      if (contentType.includes('text/event-stream')) {
-        // Concatenate the `data:` lines of the (single) SSE message into one
-        // JSON payload.
-        const dataLines = text
-          .split(/\r?\n/)
-          .filter((l) => l.startsWith('data:'))
-          .map((l) => l.slice(5).trim());
-        const joined = dataLines.join('');
-        json = joined ? JSON.parse(joined) : null;
-      } else if (text) {
-        json = JSON.parse(text);
+      const sessionIdOut = resp.headers.get('mcp-session-id');
+      const contentType = (resp.headers.get('content-type') ?? '')
+        .toLowerCase();
+      let json: unknown = null;
+      if (resp.ok) {
+        const text = await resp.text();
+        if (contentType.includes('text/event-stream')) {
+          json = parseSseResponse(text, requestId);
+        } else if (text) {
+          json = JSON.parse(text);
+        }
       }
+      return {resp, sessionIdOut, json};
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      resetSignal.removeEventListener('abort', abort);
     }
-    return {resp, sessionIdOut, json};
   }
 
-  async function ensureSession(): Promise<
-    {accessToken: string; sessionId: string}
+  async function ensureSession(signal?: AbortSignal): Promise<
+    {accessToken: string; sessionId?: string; protocolVersion: string}
   > {
-    const accessToken = await opts.getAccessToken();
-    const fresh = sessionFor === accessToken && sessionId &&
+    const epoch = transportEpoch;
+    const operationSignal = signal
+      ? AbortSignal.any([signal, transportController.signal])
+      : transportController.signal;
+    let accessToken = await opts.getAccessToken(operationSignal);
+    assertTransportEpoch(epoch);
+    const fresh = sessionReady && sessionFor === accessToken &&
+      negotiatedProtocolVersion &&
       Date.now() - sessionOpenedAt < sessionTtlMs;
-    if (fresh && sessionId) {
-      return {accessToken, sessionId};
+    if (fresh && negotiatedProtocolVersion) {
+      return {
+        accessToken,
+        sessionId,
+        protocolVersion: negotiatedProtocolVersion,
+      };
     }
-    const {resp, sessionIdOut} = await mcpFetch(accessToken, {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: {
-        protocolVersion: opts.protocolVersion,
-        capabilities: {},
-        clientInfo: opts.clientInfo,
-      },
-    });
-    if (!resp.ok) {
+
+    const initialize = (token: string) =>
+      mcpFetch(
+        token,
+        {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: opts.protocolVersion,
+            capabilities: {},
+            clientInfo: opts.clientInfo,
+          },
+        },
+        undefined,
+        undefined,
+        operationSignal,
+      );
+
+    let initialized = await initialize(accessToken);
+    assertTransportEpoch(epoch);
+    if (initialized.resp.status === 401) {
+      clearSession();
+      opts.invalidateAuth?.();
+      accessToken = await opts.getAccessToken(operationSignal);
+      assertTransportEpoch(epoch);
+      initialized = await initialize(accessToken);
+      assertTransportEpoch(epoch);
+    }
+    if (!initialized.resp.ok) {
       throw new Error(
-        `${opts.label} MCP initialize failed: HTTP ${resp.status}`,
+        `${opts.label} MCP initialize failed: HTTP ${initialized.resp.status}`,
       );
     }
-    if (!sessionIdOut) {
+    const result = extractResult<unknown>(initialized.json, 'initialize');
+    if (!Check(McpInitializeResultSchema, result)) {
       throw new Error(
-        `${opts.label} MCP initialize did not return a session id`,
+        `${opts.label} MCP initialize returned an unexpected result: ${
+          describeValidationFailure(McpInitializeResultSchema, result)
+        }`,
       );
     }
-    sessionId = sessionIdOut;
-    sessionFor = accessToken;
-    sessionOpenedAt = Date.now();
+    if (result.protocolVersion !== opts.protocolVersion) {
+      throw new Error(
+        `${opts.label} MCP negotiated unsupported protocol version ${result.protocolVersion}; expected ${opts.protocolVersion}`,
+      );
+    }
+
     if (opts.sendInitialized) {
-      // A notification carries no id and expects no result; ignore failures.
-      await mcpFetch(
+      const notified = await mcpFetch(
         accessToken,
         {jsonrpc: '2.0', method: 'notifications/initialized', params: {}},
-        sessionIdOut,
-      ).catch(() => undefined);
+        initialized.sessionIdOut ?? undefined,
+        result.protocolVersion,
+        operationSignal,
+      );
+      assertTransportEpoch(epoch);
+      if (!notified.resp.ok) {
+        throw new Error(
+          `${opts.label} MCP initialized notification failed: HTTP ${notified.resp.status}`,
+        );
+      }
     }
-    return {accessToken, sessionId: sessionIdOut};
+    assertTransportEpoch(epoch);
+    sessionId = initialized.sessionIdOut ?? undefined;
+    sessionReady = true;
+    sessionFor = accessToken;
+    sessionOpenedAt = Date.now();
+    negotiatedProtocolVersion = result.protocolVersion;
+    return {
+      accessToken,
+      sessionId,
+      protocolVersion: result.protocolVersion,
+    };
   }
 
   function extractResult<T>(json: unknown, method: string): T {
@@ -247,57 +372,83 @@ export function createMcpClient(opts: McpClientOptions): McpClient {
     return json.result as T;
   }
 
-  async function rpc<T>(method: string, params: unknown = {}): Promise<T> {
-    const session = await ensureSession();
-    const {resp, json} = await mcpFetch(session.accessToken, {
-      jsonrpc: '2.0',
-      id: Math.floor(Math.random() * 1_000_000),
-      method,
-      params,
-    }, session.sessionId);
+  async function rpc<T>(
+    method: string,
+    params: unknown = {},
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const epoch = transportEpoch;
+    const call = async (session: {
+      accessToken: string;
+      sessionId?: string;
+      protocolVersion: string;
+    }) =>
+      mcpFetch(
+        session.accessToken,
+        {
+          jsonrpc: '2.0',
+          id: Math.floor(Math.random() * 1_000_000),
+          method,
+          params,
+        },
+        session.sessionId,
+        session.protocolVersion,
+        signal,
+      );
 
-    if (resp.status === 401 || resp.status === 404) {
-      // Session/token invalidated: clear and retry exactly once.
-      sessionId = null;
-      sessionFor = null;
-      opts.invalidateAuth?.();
-      const retry = await ensureSession();
-      const {resp: r2, json: j2} = await mcpFetch(retry.accessToken, {
-        jsonrpc: '2.0',
-        id: Math.floor(Math.random() * 1_000_000),
-        method,
-        params,
-      }, retry.sessionId);
-      if (!r2.ok) {
+    const session = await ensureSession(signal);
+    assertTransportEpoch(epoch);
+    const first = await call(session);
+    assertTransportEpoch(epoch);
+    if (
+      first.resp.status === 401 ||
+      (first.resp.status === 404 && session.sessionId !== undefined)
+    ) {
+      const shouldRefreshToken = first.resp.status === 401;
+      clearSession();
+      if (shouldRefreshToken) {
+        opts.invalidateAuth?.();
+      }
+      const retrySession = await ensureSession(signal);
+      assertTransportEpoch(epoch);
+      const retry = await call(retrySession);
+      assertTransportEpoch(epoch);
+      if (!retry.resp.ok) {
         throw new Error(
-          `${opts.label} MCP ${method} failed after retry: HTTP ${r2.status}`,
+          `${opts.label} MCP ${method} failed after retry: HTTP ${retry.resp.status}`,
         );
       }
-      return extractResult<T>(j2, method);
+      return extractResult<T>(retry.json, method);
     }
-    if (!resp.ok) {
+    if (!first.resp.ok) {
       throw new Error(
-        `${opts.label} MCP ${method} failed: HTTP ${resp.status}`,
+        `${opts.label} MCP ${method} failed: HTTP ${first.resp.status}`,
       );
     }
-    return extractResult<T>(json, method);
+    return extractResult<T>(first.json, method);
   }
 
   return {
-    async listTools() {
+    async listTools(signal) {
       if (cachedTools) {
         return cachedTools;
       }
-      const result = await rpc<unknown>('tools/list');
-      cachedTools = validateTools(result, maxTools);
-      return cachedTools;
+      const epoch = transportEpoch;
+      const result = await rpc<unknown>('tools/list', {}, signal);
+      assertTransportEpoch(epoch);
+      const tools = validateTools(result, maxTools);
+      assertTransportEpoch(epoch);
+      cachedTools = tools;
+      return tools;
     },
-    async callTool(name, args) {
-      return rpc<unknown>('tools/call', {name, arguments: args});
+    async callTool(name, args, signal) {
+      return rpc<unknown>('tools/call', {name, arguments: args}, signal);
     },
     reset() {
-      sessionId = null;
-      sessionFor = null;
+      transportEpoch++;
+      transportController.abort();
+      transportController = new AbortController();
+      clearSession();
       cachedTools = null;
     },
   };
@@ -467,10 +618,8 @@ export interface ProxyToolOptions {
   description: string;
   client: McpClient;
   isWriteTool(tool: McpTool): boolean;
-  /** Whether mutating calls may proceed without a confirmation prompt. */
-  writesAllowed(): boolean;
   /** Confirmation-dialog copy for mutating tools. */
-  writeGate: {title: string; envHint: string};
+  writeGate: {title: string};
   /**
    * Optional hook to convert a thrown error into a tool result (e.g. turn a
    * "not authenticated" sentinel into a user-facing instruction). Return
@@ -506,13 +655,13 @@ export function defineMcpProxyTool(opts: ProxyToolOptions) {
     async execute(
       _id,
       params,
-      _signal,
+      signal,
       _onUpdate,
       ctx,
     ): Promise<McpProxyResult> {
       try {
         if (params.action === 'list_tools') {
-          const tools = await opts.client.listTools();
+          const tools = await opts.client.listTools(signal);
           const catalog = tools.map((t) => ({
             name: t.name,
             summary: summarizeDescription(t.description),
@@ -528,7 +677,7 @@ export function defineMcpProxyTool(opts: ProxyToolOptions) {
           if (!params.tool_name) {
             throw new Error('tool_name is required for describe_tool');
           }
-          const tools = await opts.client.listTools();
+          const tools = await opts.client.listTools(signal);
           const tool = tools.find((t) => t.name === params.tool_name);
           if (!tool) {
             throw new Error(
@@ -566,7 +715,7 @@ export function defineMcpProxyTool(opts: ProxyToolOptions) {
           // Validate the tool name locally against the catalog so a guessed
           // name turns into a self-healing prompt instead of a cryptic
           // upstream error.
-          const tools = await opts.client.listTools();
+          const tools = await opts.client.listTools(signal);
           const tool = tools.find((t) => t.name === toolName);
           if (!tool) {
             throw new Error(unknownToolError(toolName, tools, opts.label));
@@ -583,27 +732,39 @@ export function defineMcpProxyTool(opts: ProxyToolOptions) {
             );
           }
 
-          if (opts.isWriteTool(tool) && !opts.writesAllowed()) {
+          if (opts.isWriteTool(tool)) {
             const argPreview = JSON.stringify(args, null, 2).slice(0, 1500);
             const ok = await ctx.ui.confirm(
               opts.writeGate.title,
-              `pi wants to call mutating ${opts.label} tool:\n  ${toolName}\n\nArgs:\n${argPreview}\n\n(${opts.writeGate.envHint})`,
+              `pi wants to call mutating ${opts.label} tool:\n  ${toolName}\n\nArgs:\n${argPreview}`,
             );
             if (!ok) {
               throw new Error(`Blocked by user: ${toolName}`);
             }
           }
 
-          const result = await opts.client.callTool(toolName, args);
+          const result = await opts.client.callTool(toolName, args, signal);
           const text = typeof result === 'string'
             ? result
             : JSON.stringify(result, null, 2);
+          const truncation = truncateHead(text, {
+            maxBytes: DEFAULT_MAX_BYTES,
+            maxLines: DEFAULT_MAX_LINES,
+          });
+          const output = truncation.truncated
+            ? `${truncation.content}\n\n[Output truncated to ${truncation.outputLines} of ${truncation.totalLines} lines (${
+              formatSize(truncation.outputBytes)
+            } of ${
+              formatSize(truncation.totalBytes)
+            }). Refine the request to retrieve a narrower result.]`
+            : truncation.content;
           return {
-            content: [{type: 'text', text}],
+            content: [{type: 'text', text: output}],
             details: {
               action: 'call_tool',
               tool: toolName,
               mutating: opts.isWriteTool(tool),
+              truncated: truncation.truncated,
             },
           };
         }

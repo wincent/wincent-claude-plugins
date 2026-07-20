@@ -21,7 +21,7 @@ Three steps, in order:
 
 ## Write operations
 
-Mutating tools (`create`/`update`/`delete`/`mute`/etc., or `readOnlyHint: false`) are flagged `mutating: true` and prompt for per-call confirmation. Default to read-only; only invoke a write tool after the user explicitly asks. Confirmation can be skipped for a session with `DATADOG_MCP_ALLOW_WRITES=1`.
+Mutating tools (`create`/`update`/`delete`/`mute`/etc., or `readOnlyHint: false`) are flagged `mutating: true` and always prompt for per-call confirmation. Default to read-only; only invoke a write tool after the user explicitly asks.
 
 ## Untrusted input
 

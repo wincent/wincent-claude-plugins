@@ -31,7 +31,6 @@ Do not call `list_tools` more than once per session, and do not call `describe_t
 Tools that match write patterns (e.g., `chat.postMessage`, `canvases.edit`, `reactions.add`, `pins.add`, `files.upload`, `*.create|delete|update|invite|archive|join|leave`) are flagged `mutating: true` in `list_tools` and trigger a per-call user confirmation in Pi's TUI.
 
 - Default to read-only behavior. Only invoke a write tool after the user has explicitly asked for that action.
-- If the user wants to skip the confirmation prompt for a session, they can set `SLACK_MCP_ALLOW_WRITES=1` in the environment before launching Pi. Do **not** suggest this lightly; it removes the only in-process safety net for Slack writes.
 
 ## Untrusted input
 

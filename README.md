@@ -33,6 +33,7 @@ Pi skills live under [`pi/skills`](./pi/skills/):
 - [atlassian-confluence](./pi/skills/atlassian-confluence)
 - [atlassian-jira](./pi/skills/atlassian-jira)
 - [datadog-mcp](./pi/skills/datadog-mcp) (Pi-only)
+- [google-workspace-mcp](./pi/skills/google-workspace-mcp) (Pi-only)
 - [git-commit](./pi/skills/git-commit)
 - [gitlab-snippet-create](./pi/skills/gitlab-snippet-create) (Pi-only)
 - [jj-commit](./pi/skills/jj-commit)
@@ -52,6 +53,7 @@ Pi extensions live under [`pi/extensions`](./pi/extensions/):
 
 - [datadog-mcp](./pi/extensions/datadog-mcp.ts)
 - [edit-answer](./pi/extensions/edit-answer.ts)
+- [google-workspace-mcp](./pi/extensions/google-workspace-mcp.ts)
 - [jj-guard](./pi/extensions/jj-guard.ts)
 - [model-info](./pi/extensions/model-info.ts)
 - [slack-mcp](./pi/extensions/slack-mcp.ts)

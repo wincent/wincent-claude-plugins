@@ -77,7 +77,21 @@ Registers three slash commands:
 - `/datadog-logout` clears stored tokens for the current domain.
 - `/datadog-status` shows connection status (no token material).
 
-A companion `datadog-mcp` skill under `pi/skills/datadog-mcp/` teaches the agent the `list_tools`, `describe_tool`, and `call_tool` pattern. Mutating tools are gated behind a confirmation prompt unless `DATADOG_MCP_ALLOW_WRITES=1`. The target site defaults to `mcp.datadoghq.com`, overridable via `DATADOG_MCP_DOMAIN`.
+A companion `datadog-mcp` skill under `pi/skills/datadog-mcp/` teaches the agent the `list_tools`, `describe_tool`, and `call_tool` pattern. Mutating tools always require a confirmation prompt. The target site defaults to `mcp.datadoghq.com`, overridable via `DATADOG_MCP_DOMAIN`.
+
+### `google-workspace-mcp.ts`
+
+Talks to a configured Google Workspace MCP server that provides access to Google Drive, Sheets, Docs, and Slides.
+
+Registers three slash commands:
+
+- `/google-workspace-login` signs in through the browser using OAuth with PKCE and dynamic client registration.
+- `/google-workspace-logout` clears locally stored tokens; pass `all` to also clear the dynamic client registration.
+- `/google-workspace-status` shows connection status without exposing token material.
+
+A companion `google-workspace-mcp` skill under `pi/skills/google-workspace-mcp/` teaches the agent the `list_tools`, `describe_tool`, and `call_tool` pattern. Mutating tools always require a confirmation prompt; only a local allowlist of known read operations bypasses the gate, so unknown server tools default to mutating. `GOOGLE_WORKSPACE_MCP_URL` is required. `GOOGLE_WORKSPACE_MCP_ACCOUNT_DOMAIN` optionally customizes account guidance, and the local OAuth callback port defaults to `19877` with an override available through `GOOGLE_WORKSPACE_MCP_CALLBACK_PORT`.
+
+The dynamic client registration metadata and OAuth tokens are stored as plaintext JSON under `$PI_CODING_AGENT_DIR/google-workspace-mcp/` (default `~/.pi/agent/google-workspace-mcp/`). Directories and files are restricted to modes `0700` and `0600` on POSIX systems. This is not an OS credential store. The FastMCP v2.13 DCR flow registers a public client with `token_endpoint_auth_method=none`; the secret-based methods in the server's discovery metadata do not describe this client-facing flow.
 
 ### `slack-mcp.ts`
 
@@ -88,7 +102,7 @@ Registers two slash commands:
 - `/slack-status` shows status of Slack connection.
 - `/slack-refresh` forces a token refresh.
 
-A companion `slack-mcp` skill under `pi/skills/slack-mcp/` teaches the agent how to use the `list_tools`, `describe_tool`, and `call_tool` commands.
+A companion `slack-mcp` skill under `pi/skills/slack-mcp/` teaches the agent how to use the `list_tools`, `describe_tool`, and `call_tool` commands. Mutating tools always require a confirmation prompt.
 
 ### `total-cost.ts`
 
