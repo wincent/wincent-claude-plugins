@@ -101,6 +101,26 @@ export function validateTools(input: unknown, maxTools: number): McpTool[] {
 
 // ── MCP client (JSON-RPC over Streamable HTTP) ──────────────────────────────
 
+/**
+ * Protocol versions this core is wire-compatible with, newest first.
+ *
+ * `initialize` advertises the caller's preferred version, but per the spec that
+ * is a ceiling, not a demand: a server that doesn't speak it answers with the
+ * newest version it does support, and the client may either continue on that
+ * version or disconnect. Every version listed here uses the same Streamable
+ * HTTP framing, the same `MCP-Protocol-Version` header, and the same
+ * `tools/list` and `tools/call` payload shapes that this file relies on, so a
+ * downgrade to any of them is transparent to callers.
+ *
+ * Versions older than 2025-03-26 are deliberately absent: they predate
+ * Streamable HTTP, so the transport in this file would not work against them.
+ */
+export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = [
+  '2025-11-25',
+  '2025-06-18',
+  '2025-03-26',
+];
+
 export interface McpClientOptions {
   /** Human-readable name used in error messages (e.g. "Slack", "Datadog"). */
   label: string;
@@ -113,7 +133,11 @@ export interface McpClientOptions {
    * cached token (the next `getAccessToken` should re-fetch/refresh).
    */
   invalidateAuth?(): void;
-  /** Protocol version sent in `initialize`. */
+  /**
+   * Preferred protocol version sent in `initialize`. Acts as a maximum: if the
+   * server counters with an older version from SUPPORTED_PROTOCOL_VERSIONS, the
+   * session proceeds on that version instead.
+   */
   protocolVersion: string;
   /** Client identity sent in `initialize`. */
   clientInfo: {name: string; version: string};
@@ -318,9 +342,14 @@ export function createMcpClient(opts: McpClientOptions): McpClient {
         }`,
       );
     }
-    if (result.protocolVersion !== opts.protocolVersion) {
+    if (
+      result.protocolVersion !== opts.protocolVersion &&
+      !SUPPORTED_PROTOCOL_VERSIONS.includes(result.protocolVersion)
+    ) {
       throw new Error(
-        `${opts.label} MCP negotiated unsupported protocol version ${result.protocolVersion}; expected ${opts.protocolVersion}`,
+        `${opts.label} MCP negotiated unsupported protocol version ${result.protocolVersion}; requested ${opts.protocolVersion}, and this client can also speak ${
+          SUPPORTED_PROTOCOL_VERSIONS.join(', ')
+        }`,
       );
     }
 
