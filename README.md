@@ -51,6 +51,7 @@ Many of these are symlinks pointing to the corresponding Claude skills (all the 
 
 Pi extensions live under [`pi/extensions`](./pi/extensions/):
 
+- [context-breakdown](./pi/extensions/context-breakdown.ts)
 - [datadog-mcp](./pi/extensions/datadog-mcp.ts)
 - [edit-answer](./pi/extensions/edit-answer.ts)
 - [google-workspace-mcp](./pi/extensions/google-workspace-mcp.ts)

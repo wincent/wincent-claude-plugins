@@ -104,6 +104,12 @@ Registers two slash commands:
 
 A companion `slack-mcp` skill under `pi/skills/slack-mcp/` teaches the agent how to use the `list_tools`, `describe_tool`, and `call_tool` commands. Mutating tools always require a confirmation prompt.
 
+### `context-breakdown.ts`
+
+Adds a `/context` slash command, similar to the one from Claude Code, that shows how the current context window is being used. This is a counterpart to the built-in `/session`, which reports _cumulative_ session billing rather than current context composition, and to the footer, which reports context usage as a single opaque percentage.
+
+The _total_ (from `ctx.getContextUsage()`) is authoritative, coming from the provider's own token count for the last assistant turn. The _categories_ are estimated from character counts; any discrepancy is reported in the "Unaccounted" category.
+
 ### `total-cost.ts`
 
 Adds a `/total-cost` slash command that scans every saved Pi session under `$PI_CODING_AGENT_DIR/sessions` (default `~/.pi/agent/sessions`) and shows a per-month breakdown of cumulative LLM cost, message count, and number of distinct sessions. The cost is also broken down per model, with one extra column per model (ordered by total cost, descending) in the same table:
